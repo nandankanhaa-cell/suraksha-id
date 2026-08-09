@@ -1560,8 +1560,12 @@ async function decodeQRCodeFromImageData(img) {
 }
 
 function handleStep1QRUpload(event) {
-  const file = event.target.files?.[0];
+  const fileInput = event.target;
+  const file = fileInput.files?.[0];
   if (!file) return;
+
+  // Immediately clear input value so onchange fires every single time!
+  fileInput.value = '';
 
   // Immediately transition view to active processing screen while image loads & verifies
   state.currentScreen = 'scanner';
@@ -1606,8 +1610,7 @@ function handleStep1QRUpload(event) {
       };
 
       sounds.playBeep();
-      // Automatically proceed to verification animation and results!
-      executeStep2CrossVerification();
+      processScannedQRData(qrPayloadStr, !qrPayloadStr);
     };
     img.src = imgDataUrl;
   };
@@ -1615,14 +1618,16 @@ function handleStep1QRUpload(event) {
 }
 
 function handleStep2HardcopyUpload(event) {
-  const file = event.target.files?.[0];
+  const fileInput = event.target;
+  const file = fileInput.files?.[0];
   if (!file) return;
+
+  fileInput.value = '';
 
   const reader = new FileReader();
   reader.onload = function(e) {
     state.hardcopyStep2Image = e.target.result;
     render();
-    // Automatically proceed to verification animation and results!
     executeStep2CrossVerification();
   };
   reader.readAsDataURL(file);
