@@ -1249,48 +1249,92 @@ function evaluateDualAnalysis(matchedRecordInput, qrString) {
     try { parsedPayload = JSON.parse(qrString); } catch(e) {}
   }
 
-  // 1. Pipeline 1: QR & Printed Text Cross-Verification
-  const qrName = parsedPayload && parsedPayload.name 
-    ? stripNonEnglishText(parsedPayload.name) 
-    : stripNonEnglishText((matchedRecord.qrPayload && matchedRecord.qrPayload.name) || matchedRecord.printedNameOnCard || matchedRecord.fullNameEnglish);
+  // ── Pipeline 1: QR Payload vs OCR-Extracted Printed Text Cross-Verification ──
+  // qrName comes ONLY from the cryptographically signed QR payload
+  const qrName = parsedPayload && parsedPayload.name
+    ? stripNonEnglishText(parsedPayload.name)
+    : stripNonEnglishText((matchedRecord.qrPayload && matchedRecord.qrPayload.name) || matchedRecord.fullNameEnglish);
 
-  const cardTextName = stripNonEnglishText(matchedRecord.printedNameOnCard || matchedRecord.fullNameEnglish);
-  const qrMatchScore = matchedRecord.qrNameMatchScore !== undefined 
-    ? matchedRecord.qrNameMatchScore 
-    : calculateStringSimilarity(qrName, cardTextName);
+  const qrDobFromPayload = (parsedPayload && parsedPayload.dob) || (matchedRecord.qrPayload && matchedRecord.qrPayload.dob) || '';
+  const qrGenderFromPayload = (parsedPayload && parsedPayload.gender) || (matchedRecord.qrPayload && matchedRecord.qrPayload.gender) || '';
 
-  console.log(`[DUAL ANALYSIS EVALUATION]: Record ID=${matchedRecord.id}`, {
-    qrName,
-    cardTextName,
-    qrMatchScore,
-    qrStatus: matchedRecord.qrStatus
-  });
+  // ocrFields: must come from REAL OCR on the physical printed card. Never from DB preset.
+  // These are injected by runOCRAndVerify via matchedRecord._ocrExtracted
+  const ocrFields = matchedRecord._ocrExtracted || null;
 
-  const isQrSignatureValid = matchedRecord.qrStatus !== 'EXPIRED_DIGITAL_SIGNATURE' && matchedRecord.qrStatus !== 'TAMPERED_QR_PAYLOAD' && matchedRecord.qrStatus !== 'TAMPERED_CARD_TEXT';
-  const qrCrossVerified = (qrMatchScore >= 85.0) && isQrSignatureValid;
+  let cardTextName, qrMatchScore, dobMatchOk, genderMatchOk, ocrFailed;
 
-  // 2. Pipeline 2: Facial Biometric Model
+  if (ocrFields) {
+    // Real OCR path — compare actual extracted text vs QR payload
+    cardTextName = stripNonEnglishText(ocrFields.name || '');
+    qrMatchScore = cardTextName.length > 2
+      ? calculateStringSimilarity(normalizeForComparison(cardTextName), normalizeForComparison(qrName))
+      : 0;
+
+    // DOB cross-check: normalize both to YYYY-MM-DD for comparison
+    const normOcrDob = normalizeDateString(ocrFields.dob || '');
+    const normQrDob  = normalizeDateString(qrDobFromPayload);
+    dobMatchOk = !normOcrDob || !normQrDob || (normOcrDob === normQrDob);
+
+    // Gender cross-check
+    const normOcrGender = (ocrFields.gender || '').toLowerCase().trim();
+    const normQrGender  = qrGenderFromPayload.toLowerCase().trim();
+    genderMatchOk = !normOcrGender || !normQrGender || normOcrGender.startsWith(normQrGender[0]);
+
+    ocrFailed = false;
+    console.log(`[DUAL ANALYSIS EVALUATION — REAL OCR]: Record ID=${matchedRecord.id}`, {
+      qrName, cardTextName, qrMatchScore,
+      qrDob: normQrDob, ocrDob: normOcrDob, dobMatchOk,
+      qrGender: normQrGender, ocrGender: normOcrGender, genderMatchOk
+    });
+  } else {
+    // No OCR fields provided (OCR step skipped / failed) — cannot verify printed text
+    cardTextName = '[OCR NOT RUN]';
+    qrMatchScore = 0;
+    dobMatchOk = false;
+    genderMatchOk = false;
+    ocrFailed = true;
+    console.warn('[DUAL ANALYSIS EVALUATION]: No OCR fields — treating as unverifiable printed text.');
+  }
+
+  const isQrSignatureValid = matchedRecord.qrStatus !== 'EXPIRED_DIGITAL_SIGNATURE'
+    && matchedRecord.qrStatus !== 'TAMPERED_QR_PAYLOAD'
+    && matchedRecord.qrStatus !== 'TAMPERED_CARD_TEXT';
+
+  // All three OCR fields must pass: name >= 85%, DOB match, gender match
+  const qrCrossVerified = (qrMatchScore >= 85.0) && dobMatchOk && genderMatchOk && isQrSignatureValid && !ocrFailed;
+
+  // ── Pipeline 2: Facial Biometric ──
   const faceConfidence = matchedRecord.faceBiometricScore !== undefined ? matchedRecord.faceBiometricScore : 95.8;
   const faceMatchVerified = (faceConfidence >= 75.0);
 
-  // 3. Access Control Rule: BOTH MUST BE TRUE FOR ACCESS GRANTED
+  // ── Access Control Rule: BOTH pipelines must pass ──
   const accessGranted = qrCrossVerified && faceMatchVerified;
 
   let failureReason = null;
   let failCode = 'VERIFIED';
   if (!accessGranted) {
-    if (!qrCrossVerified && !faceMatchVerified) {
+    if (ocrFailed) {
+      failCode = 'OCR_FAILED';
+      failureReason = 'OCR VERIFICATION FAILED: Could not extract printed text from document image. Ensure the document is well-lit, flat, and fully visible.';
+    } else if (!qrCrossVerified && !faceMatchVerified) {
       failCode = 'CRITICAL_FAILED';
-      failureReason = 'CRITICAL ALERT: Both QR Cross-Verification and Biometric Facial Match FAILED.';
+      failureReason = 'CRITICAL ALERT: Both QR/OCR Text Cross-Verification and Biometric Facial Match FAILED.';
     } else if (!qrCrossVerified) {
-      if (matchedRecord.qrStatus === 'TAMPERED_CARD_TEXT') {
+      if (!dobMatchOk) {
+        failCode = 'DOB_MISMATCH';
+        failureReason = `DATE OF BIRTH MISMATCH: OCR-extracted DOB from printed card does NOT match QR payload DOB. Possible tampered document.`;
+      } else if (!genderMatchOk) {
+        failCode = 'GENDER_MISMATCH';
+        failureReason = `GENDER MISMATCH: OCR-extracted gender from printed card does NOT match QR payload gender.`;
+      } else if (qrMatchScore < 85.0) {
         failCode = 'TEXT_TAMPERED';
-        failureReason = `TAMPERED CARD TEXT: Printed document text ("${cardTextName}") does NOT match QR digital signature payload ("${qrName}").`;
+        failureReason = `TAMPERED CARD TEXT: Printed name ("${cardTextName}") does NOT match QR digital signature name ("${qrName}") [Similarity: ${Math.round(qrMatchScore)}% < 85% required]. Possible fake document.`;
       } else {
         failCode = 'QR_TAMPERED';
         failureReason = matchedRecord.qrStatus === 'EXPIRED_DIGITAL_SIGNATURE'
-          ? 'QR Code digital signature EXPIRED (Signature Validity Failed).'
-          : `TAMPERED QR PAYLOAD: QR Name Payload ("${qrName}") does NOT match Document Text Name ("${cardTextName}") [Similarity: ${qrMatchScore}% < 85% Required].`;
+          ? 'QR Code digital signature EXPIRED.'
+          : `QR PAYLOAD MISMATCH: Document text and QR payload do not align.`;
       }
     } else if (!faceMatchVerified) {
       failCode = 'FACE_FAILED';
@@ -1304,6 +1348,9 @@ function evaluateDualAnalysis(matchedRecordInput, qrString) {
     qrName,
     cardTextName,
     qrMatchScore,
+    dobMatchOk,
+    genderMatchOk,
+    ocrFailed,
     isQrSignatureValid,
     faceMatchVerified,
     faceConfidence,
@@ -1655,10 +1702,32 @@ function handleStep2HardcopyUpload(event) {
   reader.readAsDataURL(file);
 }
 
+// ── HELPER: Normalize date strings to YYYY-MM-DD for comparison ──
+function normalizeDateString(dateStr) {
+  if (!dateStr) return '';
+  const s = dateStr.trim();
+  // Already ISO format: YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  // DD/MM/YYYY or DD-MM-YYYY
+  const m = s.match(/^(\d{2})[\/-](\d{2})[\/-](\d{4})$/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  return s;
+}
+
 // ── OCR ENGINE: Extract printed text from document image using Tesseract.js ──
+// SECURITY: This function MUST extract from the real physical card image.
+// It NEVER falls back to preset database values for cross-verification.
 async function runOCRAndVerify(docImageDataUrl, qrPayload) {
   const matchedRecord = qrPayload.matchedRecord;
   const qrString = qrPayload.qrData;
+
+  // Parse QR payload once
+  let parsedQR = null;
+  try { parsedQR = JSON.parse(qrString); } catch(e) {}
+
+  const qrName = parsedQR?.name || matchedRecord.qrPayload?.name || matchedRecord.fullNameEnglish;
+  const qrDob = parsedQR?.dob || matchedRecord.qrPayload?.dob || matchedRecord.dob || '';
+  const qrGender = parsedQR?.gender || matchedRecord.qrPayload?.gender || matchedRecord.gender || '';
 
   // Show verifying screen immediately
   state.verifyingStep = 0;
@@ -1668,91 +1737,100 @@ async function runOCRAndVerify(docImageDataUrl, qrPayload) {
   setTimeout(() => { state.verifyingStep = 2; render(); }, 900);
   setTimeout(() => { state.verifyingStep = 3; render(); }, 1400);
 
+  // ── Real OCR extraction — no fallback to DB values ──
   let ocrExtractedName = null;
   let ocrExtractedDob = null;
   let ocrExtractedGender = null;
   let ocrRawText = '';
+  let ocrAvailable = false;
 
   try {
-    // Use Tesseract.js if available
     if (typeof Tesseract !== 'undefined') {
+      ocrAvailable = true;
       console.log('[OCR] Running Tesseract.js on hardcopy document image...');
-      const result = await Tesseract.recognize(docImageDataUrl, 'eng', {
+      const result = await Tesseract.recognize(docImageDataUrl, 'eng+kan', {
         logger: m => console.log('[OCR PROGRESS]:', m.status, Math.round((m.progress || 0) * 100) + '%')
       });
-
       ocrRawText = result.data.text || '';
       console.log('[OCR RAW TEXT]:\n', ocrRawText);
 
-      // Extract Name from OCR text
-      // Aadhaar format: Name appears after native language name line
-      // Lines like: "Nandan Kumar S H" or "Name: Nandan Kumar S H"
-      const namePatterns = [
-        /(?:Name[:\s]+)([A-Za-z\s]{4,40})/i,
-        /^([A-Z][a-z]+(?:\s+[A-Z][a-z]*){1,4})$/m,
-      ];
-      for (const pat of namePatterns) {
-        const m = ocrRawText.match(pat);
-        if (m && m[1] && m[1].trim().length > 3) {
-          ocrExtractedName = m[1].trim();
+      // ── Extract English Name from Aadhaar printed layout ──
+      // Aadhaar format (back of card or downloaded PDF):
+      //   Line 1: Name in native script (Kannada/Hindi/etc) — skip this
+      //   Line 2: Name in English — extract this
+      //   Following lines: DOB:, Gender:, Address
+      // Strategy: grab all capitalized English name-looking lines,
+      // filter out known non-name words, pick the best one.
+      const lines = ocrRawText.split(/\n/).map(l => l.trim()).filter(l => l.length > 2);
+      const nonNameWords = /^(government|of|india|aadhaar|unique|identification|authority|uidai|your|aadhaar no|enrolment|issue|date|download|dob|male|female|address|ward|vtc|po|district|state|pin|code|near|road|mobile|phone|c\/o|s\/o|d\/o|w\/o)/i;
+      const nameLinePattern = /^[A-Z][a-zA-Z]+(\s+[A-Za-z]+){1,5}$/;
+      for (const line of lines) {
+        if (nameLinePattern.test(line) && !nonNameWords.test(line) && !/\d/.test(line)) {
+          ocrExtractedName = line;
+          console.log('[OCR NAME CANDIDATE]:', line);
           break;
         }
       }
+      // Fallback: match pattern "Name: XYZ" explicitly
+      if (!ocrExtractedName) {
+        const nm = ocrRawText.match(/(?:^|\n)\s*([A-Z][a-zA-Z]+(?:\s+[A-Za-z]+){1,4})\s*(?:\n|DOB|dob|\/DOB)/m);
+        if (nm && nm[1] && nm[1].trim().length > 3) ocrExtractedName = nm[1].trim();
+      }
 
-      // Extract DOB
-      const dobMatch = ocrRawText.match(/(\d{2}[\/\-]\d{2}[\/\-]\d{4})/);
-      if (dobMatch) ocrExtractedDob = dobMatch[1];
+      // ── Extract DOB: formats DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD ──
+      // Aadhaar shows: DOB:17-11-2006 or /DOB:17-11-2006
+      const dobPatterns = [
+        /(?:DOB|Date of Birth|dob)[:\s\/]*([\d]{2}[\-\/][\d]{2}[\-\/][\d]{4})/i,
+        /([\d]{2}[\-\/][\d]{2}[\-\/][\d]{4})/,
+        /([\d]{4}[\-\/][\d]{2}[\-\/][\d]{2})/
+      ];
+      for (const pat of dobPatterns) {
+        const dm = ocrRawText.match(pat);
+        if (dm) { ocrExtractedDob = dm[1] || dm[0]; break; }
+      }
 
-      // Extract Gender
-      const genderMatch = ocrRawText.match(/\b(Male|Female|MALE|FEMALE)\b/);
-      if (genderMatch) ocrExtractedGender = genderMatch[1];
+      // ── Extract Gender: Male/Female/MALE/FEMALE or ಪುರುಷ/ಮಹಿಳೆ ──
+      const gm = ocrRawText.match(/\b(Male|Female|MALE|FEMALE|male|female)\b/);
+      if (gm) ocrExtractedGender = gm[1];
+      // Also check for Kannada ಪುರುಷ = Male
+      if (!ocrExtractedGender && ocrRawText.includes('\u0AAA\u0AC1\u0AB0\u0AC1\u0AB7')) ocrExtractedGender = 'Male';
+      if (!ocrExtractedGender && ocrRawText.includes('\u0CAA\u0CC1\u0CB0\u0CC1\u0CB7')) ocrExtractedGender = 'Male';
 
       console.log('[OCR EXTRACTED]:', { ocrExtractedName, ocrExtractedDob, ocrExtractedGender });
     } else {
-      console.warn('[OCR] Tesseract.js not available — using QR payload for verification.');
+      console.warn('[OCR] Tesseract.js not loaded — OCR verification unavailable.');
     }
   } catch (ocrErr) {
     console.warn('[OCR ERROR]:', ocrErr.message);
   }
 
-  // ── Cross-Verify OCR extracted text against QR payload ──
-  let parsedQR = null;
-  try { parsedQR = JSON.parse(qrString); } catch(e) {}
-
-  const qrName = parsedQR?.name || matchedRecord.qrPayload?.name || matchedRecord.printedNameOnCard || matchedRecord.fullNameEnglish;
-  const qrDob = parsedQR?.dob || matchedRecord.qrPayload?.dob || matchedRecord.dob || '';
-  const qrGender = parsedQR?.gender || matchedRecord.qrPayload?.gender || matchedRecord.gender || '';
-
-  // If OCR extracted a name, compare it against QR name; otherwise fall back to preset record scores
-  let nameMatchScore = matchedRecord.qrNameMatchScore !== undefined ? matchedRecord.qrNameMatchScore : 100;
-  let ocrNameUsed = qrName;
-  let hardcopyNameUsed = matchedRecord.printedNameOnCard || matchedRecord.fullNameEnglish;
-
-  if (ocrExtractedName) {
-    nameMatchScore = calculateStringSimilarity(
-      normalizeForComparison(ocrExtractedName),
-      normalizeForComparison(qrName)
-    );
-    ocrNameUsed = qrName;
-    hardcopyNameUsed = ocrExtractedName;
-    console.log(`[OCR CROSS-VERIFY] QR Name: "${qrName}" vs OCR Name: "${ocrExtractedName}" → Score: ${nameMatchScore}%`);
-  }
-
-  // Store OCR results into state for display
+  // ── Build OCR result snapshot for display ──
   state.ocrResult = {
     rawText: ocrRawText,
-    extractedName: ocrExtractedName || hardcopyNameUsed,
-    extractedDob: ocrExtractedDob || qrDob,
-    extractedGender: ocrExtractedGender || qrGender,
-    qrName: ocrNameUsed,
-    nameMatchScore: Math.round(nameMatchScore * 10) / 10
+    ocrAvailable,
+    extractedName: ocrExtractedName || null,
+    extractedDob: ocrExtractedDob || null,
+    extractedGender: ocrExtractedGender || null,
+    qrName,
+    qrDob,
+    qrGender,
+    nameMatchScore: ocrExtractedName
+      ? Math.round(calculateStringSimilarity(normalizeForComparison(ocrExtractedName), normalizeForComparison(qrName)) * 10) / 10
+      : 0
   };
 
-  // Override qrNameMatchScore in matchedRecord clone for evaluateDualAnalysis
+  console.log('[OCR RESULT SNAPSHOT]:', state.ocrResult);
+
+  // ── Inject real OCR fields into record clone for evaluateDualAnalysis ──
+  // SECURITY: _ocrExtracted is ONLY set here from real Tesseract output.
+  // evaluateDualAnalysis will REJECT any record without _ocrExtracted.
   const recordForAnalysis = {
     ...matchedRecord,
-    printedNameOnCard: ocrExtractedName || matchedRecord.printedNameOnCard || matchedRecord.fullNameEnglish,
-    qrNameMatchScore: nameMatchScore
+    _ocrExtracted: ocrAvailable ? {
+      name: ocrExtractedName || '',    // Empty string = name not found by OCR → will score 0
+      dob: ocrExtractedDob || '',
+      gender: ocrExtractedGender || ''
+    } : null  // null = OCR not available → evaluateDualAnalysis will set ocrFailed=true
   };
 
   setTimeout(() => {
@@ -1782,7 +1860,7 @@ async function runOCRAndVerify(docImageDataUrl, qrPayload) {
         verificationId: recordForAnalysis.verificationId,
         scannedQR: qrString,
         uploadedQRImage: state.uploadedQRPreview,
-        name: recordForAnalysis.fullNameEnglish || recordForAnalysis.printedNameOnCard,
+        name: recordForAnalysis.fullNameEnglish,
         docType: recordForAnalysis.docType,
         status: 'VERIFIED',
         qrScore: `${analysis.qrMatchScore}%`,
