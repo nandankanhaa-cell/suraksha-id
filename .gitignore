@@ -1,0 +1,14 @@
+node_modules
+.DS_Store
+dist
+dist-ssr
+*.local
+.gemini
+tmp
+.system_generated
+.user_uploaded
+scratch
+walkthrough.md
+implementation_plan.md
+task.md
+.git
