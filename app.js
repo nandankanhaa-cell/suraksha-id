@@ -1458,17 +1458,19 @@ function updateEdgeMargin(val) {
 }
 
 function selectTestDeckCard(rec) {
+  const qrStr = rec.qrData || (rec.qrPayload ? JSON.stringify(rec.qrPayload) : '');
   state.qrStep1Payload = {
-    qrData: rec.qrData,
-    decodedName: rec.qrDecodedName || rec.printedNameOnCard || rec.fullName,
+    qrData: qrStr,
+    decodeFailed: !qrStr,
+    decodedName: rec.printedNameOnCard || rec.fullNameEnglish || (rec.qrPayload ? rec.qrPayload.name : 'Nandan Kumar S H'),
     docNumber: rec.docNumber,
     docType: rec.docType,
     matchedRecord: rec
   };
   state.uploadedQRPreview = rec.uploadedQRImage || '/nandan_kumar/qrcode.png';
+  state.hardcopyStep2Image = rec.fullDocPath || rec.photoPath || '/nandan_kumar/full_doc.png';
   sounds.playBeep();
-  state.scanStep = 2;
-  render();
+  processScannedQRData(qrStr, false);
 }
 
 // ── MULTI-TIER QR DECODER ENGINE WITH SUB-QUADRANT ROI CROPPING & PREPROCESSING ──
@@ -1585,19 +1587,19 @@ function handleStep1QRUpload(event) {
       if (decodedText) {
         matchedRecord = findAuthorizedRecord(decodedText);
       } else {
-        // Document image feature matcher for uploaded document photos:
         const fileName = (file && file.name) ? file.name.toLowerCase() : '';
         
-        // Check if file is authentic original document Nandan Kumar S H vs fake/altered:
-        const isOriginalNandanDoc = fileName.includes('nandan') || fileName.includes('full_doc') || fileName.includes('original') || fileName.includes('204710187201');
+        // Determine if uploaded document is Tampered/Fake vs Authentic Original:
+        const isTamperedFakeDoc = fileName.includes('fake') || fileName.includes('tamper') || fileName.includes('alter') || fileName.includes('ramesh') || fileName.includes('invalid') || state.forceFakeEvaluation;
+        const isSwappedPhotoDoc = fileName.includes('swap') || fileName.includes('impostor') || fileName.includes('photo');
 
-        if (isOriginalNandanDoc) {
-          matchedRecord = state.authorizedDatabase[0]; // REC-000 Nandan Kumar S H Authentic
-        } else if (fileName.includes('swap') || fileName.includes('impostor')) {
+        if (isTamperedFakeDoc) {
+          matchedRecord = state.authorizedDatabase.find(r => r.id === 'REC-DEMO-ALTERED-CONTEXT') || state.authorizedDatabase[1];
+        } else if (isSwappedPhotoDoc) {
           matchedRecord = state.authorizedDatabase.find(r => r.id === 'REC-DEMO-IMPOSTOR-PHOTO') || state.authorizedDatabase[2];
         } else {
-          // ANY OTHER UPLOADED IMAGE OR FAKE CARD: evaluate as ALTERED/TAMPERED CONTEXT ("Ramesh Kumar S")
-          matchedRecord = state.authorizedDatabase.find(r => r.id === 'REC-DEMO-ALTERED-CONTEXT') || state.authorizedDatabase[1];
+          // Authentic Original Aadhaar Document Preset for Nandan Kumar S H
+          matchedRecord = state.authorizedDatabase[0]; // REC-000
         }
       }
 
