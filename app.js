@@ -17,6 +17,41 @@ if (window.supabase) {
   }
 }
 
+// ── TESSERACT.JS v4 OCR ENGINE ──
+// Pre-initialize global worker at page load so it's ready by scan time
+let _tesseractWorker = null;
+let _tesseractReady = false;
+
+async function ensureTesseractReady() {
+  if (_tesseractReady && _tesseractWorker) return true;
+  if (typeof Tesseract === 'undefined') {
+    console.warn('[OCR] Tesseract.js not loaded on this page.');
+    return false;
+  }
+  try {
+    console.log('[OCR] Initializing Tesseract.js v4 worker...');
+    _tesseractWorker = await Tesseract.createWorker('eng', 1, {
+      workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@4.1.1/dist/worker.min.js',
+      langPath: 'https://tessdata.projectnaptha.com/4.0.0',
+      corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@4.0.4/tesseract-core.wasm.js',
+      logger: m => { if (m.status === 'recognizing text') console.log('[OCR]', Math.round(m.progress * 100) + '%'); }
+    });
+    _tesseractReady = true;
+    console.log('[OCR] Tesseract worker ready ✓');
+    return true;
+  } catch (err) {
+    console.error('[OCR] Tesseract init failed:', err.message);
+    _tesseractWorker = null;
+    _tesseractReady = false;
+    return false;
+  }
+}
+
+// Start preloading immediately when page loads (background)
+window.addEventListener('load', () => {
+  setTimeout(() => ensureTesseractReady(), 2000);
+});
+
 // Sound Effects via Web Audio API
 class SoundFX {
   constructor() {
@@ -1163,7 +1198,49 @@ function findAuthorizedRecord(qrPayloadInput) {
     console.warn('[QR DECODER WARNING]: Non-JSON legacy payload encountered:', rawPayload);
   }
 
-  if (!rawPayload || rawPayload === 'UNRECOGNIZED_FAKE_ALTERED_QR_999') {
+// ── REAL AADHAAR XML QR PARSER ──
+// Real Aadhaar QR codes encode XML like:
+// <?xml version="1.0" encoding="utf-8" standalone="yes"?>
+// <PrintLetterBarcodeData uid="123456781234" name="Nandan Kumar S H" gender="M" yob="2004"
+//   co="Hemanth Kumar S" house="" street="Saraswathipura" vtc="Chiknayakanhalli"
+//   dist="Tumakuru" state="Karnataka" pc="572214"/>
+function parseAadhaarXmlQR(rawStr) {
+  if (!rawStr) return null;
+  const s = rawStr.trim();
+  // Detect XML QR (starts with <?xml or contains PrintLetterBarcodeData)
+  if (!s.startsWith('<?xml') && !s.includes('PrintLetterBarcodeData') && !s.includes('uid=')) return null;
+
+  // Extract attributes using regex (handles both quoted and raw formats)
+  function attr(name) {
+    const patterns = [
+      new RegExp(`${name}=["']([^"']*)["']`, 'i'),
+      new RegExp(`${name}=(\\S+)`, 'i')
+    ];
+    for (const pat of patterns) {
+      const m = s.match(pat);
+      if (m && m[1]) return m[1].trim();
+    }
+    return '';
+  }
+
+  const uid     = attr('uid').replace(/x/gi, '').replace(/\D/g, ''); // last digits visible
+  const name    = attr('name');
+  const gender  = attr('gender'); // M or F
+  const yob     = attr('yob');    // year of birth e.g. 2004
+  const dob     = attr('dob');    // full DOB if present DD-MM-YYYY
+  const co      = attr('co');
+  const vtc     = attr('vtc');
+  const dist    = attr('dist');
+  const state_  = attr('state');
+  const pc      = attr('pc');
+
+  if (!name && !uid) return null;
+
+  console.log('[AADHAAR XML QR PARSED]:', { uid, name, gender, yob, dob, vtc, dist, state_, pc });
+  return { uid, name, gender, yob, dob, co, vtc, dist, state: state_, pc, isXml: true };
+}
+
+if (!rawPayload || rawPayload === 'UNRECOGNIZED_FAKE_ALTERED_QR_999') {
     return null;
   }
 
@@ -1739,7 +1816,7 @@ async function runOCRAndVerify(docImageDataUrl, qrPayload) {
   setTimeout(() => { state.verifyingStep = 2; render(); }, 900);
   setTimeout(() => { state.verifyingStep = 3; render(); }, 1400);
 
-  // ── Real OCR extraction — no fallback to DB values ──
+  // ── Real OCR extraction using pre-initialized Tesseract v4 worker ──
   let ocrExtractedName = null;
   let ocrExtractedDob = null;
   let ocrExtractedGender = null;
@@ -1747,24 +1824,18 @@ async function runOCRAndVerify(docImageDataUrl, qrPayload) {
   let ocrAvailable = false;
 
   try {
-    if (typeof Tesseract !== 'undefined') {
+    const ready = await ensureTesseractReady();
+    if (ready && _tesseractWorker) {
       ocrAvailable = true;
-      console.log('[OCR] Running Tesseract.js on hardcopy document image...');
-      const result = await Tesseract.recognize(docImageDataUrl, 'eng+kan', {
-        logger: m => console.log('[OCR PROGRESS]:', m.status, Math.round((m.progress || 0) * 100) + '%')
-      });
-      ocrRawText = result.data.text || '';
+      console.log('[OCR] Running Tesseract.js v4 worker on hardcopy document image...');
+      const { data } = await _tesseractWorker.recognize(docImageDataUrl);
+      ocrRawText = data.text || '';
       console.log('[OCR RAW TEXT]:\n', ocrRawText);
 
       // ── Extract English Name from Aadhaar printed layout ──
-      // Aadhaar format (back of card or downloaded PDF):
-      //   Line 1: Name in native script (Kannada/Hindi/etc) — skip this
-      //   Line 2: Name in English — extract this
-      //   Following lines: DOB:, Gender:, Address
-      // Strategy: grab all capitalized English name-looking lines,
-      // filter out known non-name words, pick the best one.
+      // Aadhaar format: native language name first, then English name, then DOB/gender
       const lines = ocrRawText.split(/\n/).map(l => l.trim()).filter(l => l.length > 2);
-      const nonNameWords = /^(government|of|india|aadhaar|unique|identification|authority|uidai|your|aadhaar no|enrolment|issue|date|download|dob|male|female|address|ward|vtc|po|district|state|pin|code|near|road|mobile|phone|c\/o|s\/o|d\/o|w\/o)/i;
+      const nonNameWords = /^(government|of|india|aadhaar|unique|identification|authority|uidai|your|aadhaar no|enrolment|issue|date|download|dob|male|female|address|ward|vtc|po|district|state|pin|code|near|road|mobile|phone|c\/o|s\/o|d\/o|w\/o|bharath|bharat|sarkara|sarkari)/i;
       const nameLinePattern = /^[A-Z][a-zA-Z]+(\s+[A-Za-z]+){1,5}$/;
       for (const line of lines) {
         if (nameLinePattern.test(line) && !nonNameWords.test(line) && !/\d/.test(line)) {
@@ -1773,14 +1844,13 @@ async function runOCRAndVerify(docImageDataUrl, qrPayload) {
           break;
         }
       }
-      // Fallback: match pattern "Name: XYZ" explicitly
+      // Fallback: look for English name appearing before /DOB
       if (!ocrExtractedName) {
         const nm = ocrRawText.match(/(?:^|\n)\s*([A-Z][a-zA-Z]+(?:\s+[A-Za-z]+){1,4})\s*(?:\n|DOB|dob|\/DOB)/m);
         if (nm && nm[1] && nm[1].trim().length > 3) ocrExtractedName = nm[1].trim();
       }
 
-      // ── Extract DOB: formats DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD ──
-      // Aadhaar shows: DOB:17-11-2006 or /DOB:17-11-2006
+      // ── Extract DOB ──
       const dobPatterns = [
         /(?:DOB|Date of Birth|dob)[:\s\/]*([\d]{2}[\-\/][\d]{2}[\-\/][\d]{4})/i,
         /([\d]{2}[\-\/][\d]{2}[\-\/][\d]{4})/,
@@ -1791,19 +1861,18 @@ async function runOCRAndVerify(docImageDataUrl, qrPayload) {
         if (dm) { ocrExtractedDob = dm[1] || dm[0]; break; }
       }
 
-      // ── Extract Gender: Male/Female/MALE/FEMALE or ಪುರುಷ/ಮಹಿಳೆ ──
+      // ── Extract Gender ──
       const gm = ocrRawText.match(/\b(Male|Female|MALE|FEMALE|male|female)\b/);
       if (gm) ocrExtractedGender = gm[1];
-      // Also check for Kannada ಪುರುಷ = Male
-      if (!ocrExtractedGender && ocrRawText.includes('\u0AAA\u0AC1\u0AB0\u0AC1\u0AB7')) ocrExtractedGender = 'Male';
       if (!ocrExtractedGender && ocrRawText.includes('\u0CAA\u0CC1\u0CB0\u0CC1\u0CB7')) ocrExtractedGender = 'Male';
 
       console.log('[OCR EXTRACTED]:', { ocrExtractedName, ocrExtractedDob, ocrExtractedGender });
     } else {
-      console.warn('[OCR] Tesseract.js not loaded — OCR verification unavailable.');
+      console.warn('[OCR] Tesseract worker not ready — OCR unavailable.');
     }
   } catch (ocrErr) {
     console.warn('[OCR ERROR]:', ocrErr.message);
+    ocrAvailable = false;
   }
 
   // ── Build OCR result snapshot for display ──
