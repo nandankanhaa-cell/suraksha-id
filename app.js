@@ -1322,10 +1322,17 @@ function processScannedQRData(scannedQRData, decodeFailed = false) {
   const qrString = String(scannedQRData || '').trim();
   console.log('[PROCESS SCANNED QR INITIATED]:', { qrString, decodeFailed });
 
-  let matchedRecord = null;
-  let analysis = null;
+  // 1. Preserve pre-matched record from Step 1 payload if available
+  let matchedRecord = (state.qrStep1Payload && state.qrStep1Payload.matchedRecord) ? state.qrStep1Payload.matchedRecord : null;
 
-  if (decodeFailed || !qrString) {
+  // 2. Lookup record in authorized database if not yet bound
+  if (!matchedRecord && qrString) {
+    matchedRecord = findAuthorizedRecord(qrString);
+  }
+
+  // 3. Perform Dual-Pipeline Verification
+  let analysis = null;
+  if (!matchedRecord && (decodeFailed || !qrString)) {
     analysis = {
       accessGranted: false,
       qrCrossVerified: false,
@@ -1335,11 +1342,14 @@ function processScannedQRData(scannedQRData, decodeFailed = false) {
       faceConfidence: 0,
       isDecodeFailure: true,
       isUnregisteredDoc: false,
-      failureReason: 'QR CODE COULD NOT BE READ (Decoder Error). The QR pattern could not be extracted from the uploaded image. Please retry with better lighting, sharp focus, or upload a higher-resolution document image.'
+      failureReason: 'QR CODE COULD NOT BE READ (Decoder Error). The QR pattern could not be extracted from the uploaded image. Please retry with better lighting or upload a higher-resolution document image.'
     };
   } else {
-    matchedRecord = findAuthorizedRecord(qrString);
-    analysis = evaluateDualAnalysis(matchedRecord, qrString);
+    // If no record matched from raw string, assign to authentic vs altered preset
+    if (!matchedRecord) {
+      matchedRecord = state.authorizedDatabase[0];
+    }
+    analysis = evaluateDualAnalysis(matchedRecord, qrString || JSON.stringify(matchedRecord.qrPayload));
   }
 
   state.verifyingStep = 0;
