@@ -2108,6 +2108,12 @@ function isWithinDutyGeofence() {
 }
 
 function attemptOpenScanner() {
+  state.scanStep = 1;
+  state.qrStep1Payload = null;
+  state.hardcopyStep2Image = null;
+  state.uploadedQRPreview = null;
+  state.verificationResult = null;
+  state.forceFakeEvaluation = false;
   updateLiveGpsDistances();
   setScreen('scanner');
 }
@@ -3459,6 +3465,19 @@ function renderQRScanner() {
             <p class="text-xs text-slate-300 max-w-md mx-auto leading-relaxed">
               At first, scan the QR code on the Aadhaar Card. The app will decode the encrypted QR signature and payload details.
             </p>
+          </div>
+
+          <!-- Document Verification Target Mode Selector -->
+          <div class="p-3 bg-slate-900/90 rounded-2xl border border-white/15 space-y-2 text-left">
+            <span class="text-[10px] font-extrabold text-gov-lightBlue uppercase tracking-wider block">Document Verification Mode:</span>
+            <div class="grid grid-cols-2 gap-2">
+              <button onclick="state.forceFakeEvaluation=false; render();" class="py-2.5 px-3 rounded-xl text-xs font-extrabold flex items-center justify-center space-x-1.5 transition ${!state.forceFakeEvaluation ? 'bg-emerald-500 text-white shadow-lg border border-emerald-300' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'}">
+                <span>🟢 Authentic Card</span>
+              </button>
+              <button onclick="state.forceFakeEvaluation=true; render();" class="py-2.5 px-3 rounded-xl text-xs font-extrabold flex items-center justify-center space-x-1.5 transition ${state.forceFakeEvaluation ? 'bg-red-500 text-white shadow-lg border border-red-300' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'}">
+                <span>🛑 Fake / Altered Card</span>
+              </button>
+            </div>
           </div>
 
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
