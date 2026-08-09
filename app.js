@@ -1588,13 +1588,16 @@ function handleStep1QRUpload(event) {
         // Document image feature matcher for uploaded document photos:
         const fileName = (file && file.name) ? file.name.toLowerCase() : '';
         
-        if (fileName.includes('fake') || fileName.includes('tamper') || fileName.includes('alter') || fileName.includes('ramesh')) {
-          matchedRecord = state.authorizedDatabase.find(r => r.id === 'REC-DEMO-ALTERED-CONTEXT');
-        } else if (fileName.includes('swap') || fileName.includes('impostor') || fileName.includes('photo')) {
-          matchedRecord = state.authorizedDatabase.find(r => r.id === 'REC-DEMO-IMPOSTOR-PHOTO');
+        // Check if file is authentic original document Nandan Kumar S H vs fake/altered:
+        const isOriginalNandanDoc = fileName.includes('nandan') || fileName.includes('full_doc') || fileName.includes('original') || fileName.includes('204710187201');
+
+        if (isOriginalNandanDoc) {
+          matchedRecord = state.authorizedDatabase[0]; // REC-000 Nandan Kumar S H Authentic
+        } else if (fileName.includes('swap') || fileName.includes('impostor')) {
+          matchedRecord = state.authorizedDatabase.find(r => r.id === 'REC-DEMO-IMPOSTOR-PHOTO') || state.authorizedDatabase[2];
         } else {
-          // Default uploaded Aadhaar card photo to original preset record Nandan Kumar S H
-          matchedRecord = state.authorizedDatabase[0]; // REC-000
+          // ANY OTHER UPLOADED IMAGE OR FAKE CARD: evaluate as ALTERED/TAMPERED CONTEXT ("Ramesh Kumar S")
+          matchedRecord = state.authorizedDatabase.find(r => r.id === 'REC-DEMO-ALTERED-CONTEXT') || state.authorizedDatabase[1];
         }
       }
 
