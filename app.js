@@ -1512,20 +1512,22 @@ function updateEdgeMargin(val) {
   render();
 }
 
+// Test deck card selection: loads QR into Step 1 buffer, advances to Step 2 for OCR
 function selectTestDeckCard(rec) {
   const qrStr = rec.qrData || (rec.qrPayload ? JSON.stringify(rec.qrPayload) : '');
   state.qrStep1Payload = {
     qrData: qrStr,
     decodeFailed: !qrStr,
-    decodedName: rec.printedNameOnCard || rec.fullNameEnglish || (rec.qrPayload ? rec.qrPayload.name : 'Nandan Kumar S H'),
+    decodedName: rec.printedNameOnCard || rec.fullNameEnglish || (rec.qrPayload ? rec.qrPayload.name : 'Unknown'),
     docNumber: rec.docNumber,
     docType: rec.docType,
     matchedRecord: rec
   };
   state.uploadedQRPreview = rec.uploadedQRImage || '/nandan_kumar/qrcode.png';
-  state.hardcopyStep2Image = rec.fullDocPath || rec.photoPath || '/nandan_kumar/full_doc.png';
+  state.hardcopyStep2Image = null; // Force user to upload hardcopy for real OCR
+  state.scanStep = 2;
   sounds.playBeep();
-  processScannedQRData(qrStr, false);
+  render();
 }
 
 // ── MULTI-TIER QR DECODER ENGINE WITH SUB-QUADRANT ROI CROPPING & PREPROCESSING ──
@@ -1895,12 +1897,19 @@ async function runOCRAndVerify(docImageDataUrl, qrPayload) {
 }
 
 function executeStep2CrossVerification() {
+  // This is only called when hardcopyStep2Image is already set
+  // Run real OCR on the uploaded image instead of bypassing
   if (!state.qrStep1Payload) {
     state.scanStep = 1;
     render();
     return;
   }
-  processScannedQRData(state.qrStep1Payload.qrData, state.qrStep1Payload.decodeFailed);
+  if (state.hardcopyStep2Image) {
+    runOCRAndVerify(state.hardcopyStep2Image, state.qrStep1Payload);
+  } else {
+    // No hardcopy uploaded yet — prompt user
+    alert('Please upload or snap the printed document card first for OCR verification.');
+  }
 }
 
 function handleQRFileUpload(event) {
@@ -2043,7 +2052,23 @@ function startCameraScannerLoop() {
         if (qrFoundData) {
           sounds.playBeep();
           stopCameraScanner();
-          processScannedQRData(qrFoundData);
+          // QR decoded from live camera — find record, advance to Step 2 for OCR
+          const matchedFromCamera = findAuthorizedRecord(qrFoundData);
+          if (matchedFromCamera) {
+            state.qrStep1Payload = {
+              qrData: qrFoundData,
+              decodeFailed: false,
+              decodedName: matchedFromCamera.printedNameOnCard || matchedFromCamera.fullNameEnglish,
+              docNumber: matchedFromCamera.docNumber,
+              docType: matchedFromCamera.docType,
+              matchedRecord: matchedFromCamera
+            };
+            state.scanStep = 2;
+            render();
+          } else {
+            // QR read but no record in DB
+            processScannedQRData(qrFoundData, false);
+          }
           return;
         }
       }
