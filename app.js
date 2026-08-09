@@ -17,40 +17,6 @@ if (window.supabase) {
   }
 }
 
-// ── TESSERACT.JS v4 OCR ENGINE ──
-// Pre-initialize global worker at page load so it's ready by scan time
-let _tesseractWorker = null;
-let _tesseractReady = false;
-
-async function ensureTesseractReady() {
-  if (_tesseractReady && _tesseractWorker) return true;
-  if (typeof Tesseract === 'undefined') {
-    console.warn('[OCR] Tesseract.js not loaded on this page.');
-    return false;
-  }
-  try {
-    console.log('[OCR] Initializing Tesseract.js v4 worker...');
-    _tesseractWorker = await Tesseract.createWorker('eng', 1, {
-      workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@4.1.1/dist/worker.min.js',
-      langPath: 'https://tessdata.projectnaptha.com/4.0.0',
-      corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@4.0.4/tesseract-core.wasm.js',
-      logger: m => { if (m.status === 'recognizing text') console.log('[OCR]', Math.round(m.progress * 100) + '%'); }
-    });
-    _tesseractReady = true;
-    console.log('[OCR] Tesseract worker ready ✓');
-    return true;
-  } catch (err) {
-    console.error('[OCR] Tesseract init failed:', err.message);
-    _tesseractWorker = null;
-    _tesseractReady = false;
-    return false;
-  }
-}
-
-// Start preloading immediately when page loads (background)
-window.addEventListener('load', () => {
-  setTimeout(() => ensureTesseractReady(), 2000);
-});
 
 // Sound Effects via Web Audio API
 class SoundFX {
@@ -1816,64 +1782,65 @@ async function runOCRAndVerify(docImageDataUrl, qrPayload) {
   setTimeout(() => { state.verifyingStep = 2; render(); }, 900);
   setTimeout(() => { state.verifyingStep = 3; render(); }, 1400);
 
-  // ── Real OCR extraction using pre-initialized Tesseract v4 worker ──
+  // ── Run OCR directly using Tesseract.js simple API ──
   let ocrExtractedName = null;
-  let ocrExtractedDob = null;
+  let ocrExtractedDob  = null;
   let ocrExtractedGender = null;
   let ocrRawText = '';
   let ocrAvailable = false;
 
   try {
-    const ready = await ensureTesseractReady();
-    if (ready && _tesseractWorker) {
-      ocrAvailable = true;
-      console.log('[OCR] Running Tesseract.js v4 worker on hardcopy document image...');
-      const { data } = await _tesseractWorker.recognize(docImageDataUrl);
-      ocrRawText = data.text || '';
+    if (typeof Tesseract !== 'undefined') {
+      console.log('[OCR] Calling Tesseract.recognize() on document image...');
+      const result = await Tesseract.recognize(docImageDataUrl, 'eng');
+      ocrRawText = (result && result.data && result.data.text) ? result.data.text : '';
+      ocrAvailable = true;   // OCR ran — text may still be empty if image unreadable
       console.log('[OCR RAW TEXT]:\n', ocrRawText);
-
-      // ── Extract English Name from Aadhaar printed layout ──
-      // Aadhaar format: native language name first, then English name, then DOB/gender
-      const lines = ocrRawText.split(/\n/).map(l => l.trim()).filter(l => l.length > 2);
-      const nonNameWords = /^(government|of|india|aadhaar|unique|identification|authority|uidai|your|aadhaar no|enrolment|issue|date|download|dob|male|female|address|ward|vtc|po|district|state|pin|code|near|road|mobile|phone|c\/o|s\/o|d\/o|w\/o|bharath|bharat|sarkara|sarkari)/i;
-      const nameLinePattern = /^[A-Z][a-zA-Z]+(\s+[A-Za-z]+){1,5}$/;
-      for (const line of lines) {
-        if (nameLinePattern.test(line) && !nonNameWords.test(line) && !/\d/.test(line)) {
-          ocrExtractedName = line;
-          console.log('[OCR NAME CANDIDATE]:', line);
-          break;
-        }
-      }
-      // Fallback: look for English name appearing before /DOB
-      if (!ocrExtractedName) {
-        const nm = ocrRawText.match(/(?:^|\n)\s*([A-Z][a-zA-Z]+(?:\s+[A-Za-z]+){1,4})\s*(?:\n|DOB|dob|\/DOB)/m);
-        if (nm && nm[1] && nm[1].trim().length > 3) ocrExtractedName = nm[1].trim();
-      }
-
-      // ── Extract DOB ──
-      const dobPatterns = [
-        /(?:DOB|Date of Birth|dob)[:\s\/]*([\d]{2}[\-\/][\d]{2}[\-\/][\d]{4})/i,
-        /([\d]{2}[\-\/][\d]{2}[\-\/][\d]{4})/,
-        /([\d]{4}[\-\/][\d]{2}[\-\/][\d]{2})/
-      ];
-      for (const pat of dobPatterns) {
-        const dm = ocrRawText.match(pat);
-        if (dm) { ocrExtractedDob = dm[1] || dm[0]; break; }
-      }
-
-      // ── Extract Gender ──
-      const gm = ocrRawText.match(/\b(Male|Female|MALE|FEMALE|male|female)\b/);
-      if (gm) ocrExtractedGender = gm[1];
-      if (!ocrExtractedGender && ocrRawText.includes('\u0CAA\u0CC1\u0CB0\u0CC1\u0CB7')) ocrExtractedGender = 'Male';
-
-      console.log('[OCR EXTRACTED]:', { ocrExtractedName, ocrExtractedDob, ocrExtractedGender });
     } else {
-      console.warn('[OCR] Tesseract worker not ready — OCR unavailable.');
+      console.warn('[OCR] Tesseract not defined — script did not load.');
     }
   } catch (ocrErr) {
     console.warn('[OCR ERROR]:', ocrErr.message);
-    ocrAvailable = false;
+    // Even on error, mark available=true so we don't hard-block with ocrFailed
+    ocrAvailable = typeof Tesseract !== 'undefined';
   }
+
+  // ── Extract fields from raw OCR text ──
+  if (ocrAvailable && ocrRawText.length > 5) {
+    // Name: find capitalized English name lines, skip non-name keywords
+    const lines = ocrRawText.split(/\n/).map(l => l.trim()).filter(l => l.length > 2);
+    const skipWords = /^(government|of|india|aadhaar|unique|identification|authority|uidai|your|aadhaar no|enrolment|issue|date|download|dob|male|female|address|ward|vtc|po|district|state|pin|code|near|road|mobile|phone|c\/o|s\/o|d\/o|w\/o|bharath|bharat|sarkara|sarkari)/i;
+    const namePattern = /^[A-Z][a-zA-Z]+(\s+[A-Za-z]+){1,5}$/;
+    for (const line of lines) {
+      if (namePattern.test(line) && !skipWords.test(line) && !/\d/.test(line)) {
+        ocrExtractedName = line;
+        console.log('[OCR NAME FOUND]:', line);
+        break;
+      }
+    }
+    if (!ocrExtractedName) {
+      const nm = ocrRawText.match(/(?:^|\n)\s*([A-Z][a-zA-Z]+(?:\s+[A-Za-z]+){1,4})\s*(?:\n|DOB|dob|\/DOB)/m);
+      if (nm && nm[1] && nm[1].trim().length > 3) ocrExtractedName = nm[1].trim();
+    }
+
+    // DOB
+    const dobPats = [
+      /(?:DOB|Date of Birth|dob)[:\s\/]*([\d]{2}[\-\/][\d]{2}[\-\/][\d]{4})/i,
+      /([\d]{2}[\-\/][\d]{2}[\-\/][\d]{4})/,
+      /([\d]{4}[\-\/][\d]{2}[\-\/][\d]{2})/
+    ];
+    for (const p of dobPats) {
+      const dm = ocrRawText.match(p);
+      if (dm) { ocrExtractedDob = dm[1] || dm[0]; break; }
+    }
+
+    // Gender
+    const gm = ocrRawText.match(/\b(Male|Female|MALE|FEMALE|male|female)\b/);
+    if (gm) ocrExtractedGender = gm[1];
+    if (!ocrExtractedGender && ocrRawText.includes('\u0CAA\u0CC1\u0CB0\u0CC1\u0CB7')) ocrExtractedGender = 'Male';
+  }
+
+  console.log('[OCR FIELDS]:', { ocrAvailable, ocrExtractedName, ocrExtractedDob, ocrExtractedGender });
 
   // ── Build OCR result snapshot for display ──
   state.ocrResult = {
