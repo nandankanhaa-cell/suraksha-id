@@ -1569,81 +1569,251 @@ async function decodeQRCodeFromImageData(img) {
   return null;
 }
 
+// ── STAGE 1: QR CODE SCAN → FIND RECORD IN DATABASE ──
 function handleStep1QRUpload(event) {
   const fileInput = event.target;
   const file = fileInput.files?.[0];
   if (!file) return;
-
-  // Immediately clear input value so onchange fires every single time!
   fileInput.value = '';
 
-  // Immediately transition view to active processing screen while image loads & verifies
   state.currentScreen = 'scanner';
-  state.scanStep = 2;
+  state.scanStep = 1;
+  state.uploadedQRPreview = null;
   render();
 
   const reader = new FileReader();
   reader.onload = function(e) {
     const imgDataUrl = e.target.result;
     state.uploadedQRPreview = imgDataUrl;
+    render();
 
     const img = new Image();
     img.onload = async function() {
+      // Attempt real QR decode first
       const decodedText = await decodeQRCodeFromImageData(img);
-      
-      let matchedRecord = null;
-      if (decodedText) {
-        matchedRecord = findAuthorizedRecord(decodedText);
-      } else {
-        const fileName = (file && file.name) ? file.name.toLowerCase() : '';
-        
-        // Determine if uploaded document is Tampered/Fake vs Authentic Original:
-        const isTamperedFakeDoc = fileName.includes('fake') || fileName.includes('tamper') || fileName.includes('alter') || fileName.includes('ramesh') || fileName.includes('invalid') || state.forceFakeEvaluation;
-        const isSwappedPhotoDoc = fileName.includes('swap') || fileName.includes('impostor') || fileName.includes('photo');
 
-        if (isTamperedFakeDoc) {
-          matchedRecord = state.authorizedDatabase.find(r => r.id === 'REC-DEMO-ALTERED-CONTEXT') || state.authorizedDatabase[1];
-        } else if (isSwappedPhotoDoc) {
-          matchedRecord = state.authorizedDatabase.find(r => r.id === 'REC-DEMO-IMPOSTOR-PHOTO') || state.authorizedDatabase[2];
-        } else {
-          // Authentic Original Aadhaar Document Preset for Nandan Kumar S H
-          matchedRecord = state.authorizedDatabase[0]; // REC-000
+      let matchedRecord = null;
+      let qrPayloadStr = '';
+
+      if (decodedText) {
+        // QR successfully decoded — look up in database
+        matchedRecord = findAuthorizedRecord(decodedText);
+        qrPayloadStr = decodedText;
+
+        if (!matchedRecord) {
+          // QR read but genuinely not in database
+          sounds.playAlert();
+          processScannedQRData(decodedText, false);
+          return;
         }
+      } else {
+        // QR could not be decoded from image — treat as QR decode failure
+        sounds.playAlert();
+        processScannedQRData('', true);
+        return;
       }
 
-      const qrPayloadStr = decodedText || (matchedRecord ? JSON.stringify(matchedRecord.qrPayload) : '');
-
+      // QR found & record matched → advance to Step 2 for OCR hardcopy scan
+      qrPayloadStr = decodedText || JSON.stringify(matchedRecord.qrPayload);
       state.qrStep1Payload = {
         qrData: qrPayloadStr,
-        decodeFailed: !qrPayloadStr,
-        decodedName: matchedRecord ? (matchedRecord.printedNameOnCard || matchedRecord.fullNameEnglish) : 'UNREGISTERED / UNRECOGNIZED ID',
-        docNumber: matchedRecord ? matchedRecord.docNumber : 'UNREGISTERED',
-        docType: matchedRecord ? matchedRecord.docType : 'Aadhaar Card',
+        decodeFailed: false,
+        decodedName: matchedRecord.printedNameOnCard || matchedRecord.fullNameEnglish,
+        docNumber: matchedRecord.docNumber,
+        docType: matchedRecord.docType,
         matchedRecord: matchedRecord
       };
-
       sounds.playBeep();
-      processScannedQRData(qrPayloadStr, !qrPayloadStr);
+      state.scanStep = 2;
+      render();
     };
     img.src = imgDataUrl;
   };
   reader.readAsDataURL(file);
 }
 
+// ── STAGE 2: HARDCOPY DOCUMENT SCAN → OCR → CROSS-VERIFY AGAINST QR ──
 function handleStep2HardcopyUpload(event) {
   const fileInput = event.target;
   const file = fileInput.files?.[0];
   if (!file) return;
-
   fileInput.value = '';
 
+  if (!state.qrStep1Payload || !state.qrStep1Payload.matchedRecord) {
+    alert('Please scan the QR code first (Step 1).');
+    state.scanStep = 1;
+    render();
+    return;
+  }
+
   const reader = new FileReader();
-  reader.onload = function(e) {
+  reader.onload = async function(e) {
     state.hardcopyStep2Image = e.target.result;
     render();
-    executeStep2CrossVerification();
+    await runOCRAndVerify(state.hardcopyStep2Image, state.qrStep1Payload);
   };
   reader.readAsDataURL(file);
+}
+
+// ── OCR ENGINE: Extract printed text from document image using Tesseract.js ──
+async function runOCRAndVerify(docImageDataUrl, qrPayload) {
+  const matchedRecord = qrPayload.matchedRecord;
+  const qrString = qrPayload.qrData;
+
+  // Show verifying screen immediately
+  state.verifyingStep = 0;
+  setScreen('verifying');
+  sounds.playBeep();
+  setTimeout(() => { state.verifyingStep = 1; render(); }, 400);
+  setTimeout(() => { state.verifyingStep = 2; render(); }, 900);
+  setTimeout(() => { state.verifyingStep = 3; render(); }, 1400);
+
+  let ocrExtractedName = null;
+  let ocrExtractedDob = null;
+  let ocrExtractedGender = null;
+  let ocrRawText = '';
+
+  try {
+    // Use Tesseract.js if available
+    if (typeof Tesseract !== 'undefined') {
+      console.log('[OCR] Running Tesseract.js on hardcopy document image...');
+      const result = await Tesseract.recognize(docImageDataUrl, 'eng', {
+        logger: m => console.log('[OCR PROGRESS]:', m.status, Math.round((m.progress || 0) * 100) + '%')
+      });
+
+      ocrRawText = result.data.text || '';
+      console.log('[OCR RAW TEXT]:\n', ocrRawText);
+
+      // Extract Name from OCR text
+      // Aadhaar format: Name appears after native language name line
+      // Lines like: "Nandan Kumar S H" or "Name: Nandan Kumar S H"
+      const namePatterns = [
+        /(?:Name[:\s]+)([A-Za-z\s]{4,40})/i,
+        /^([A-Z][a-z]+(?:\s+[A-Z][a-z]*){1,4})$/m,
+      ];
+      for (const pat of namePatterns) {
+        const m = ocrRawText.match(pat);
+        if (m && m[1] && m[1].trim().length > 3) {
+          ocrExtractedName = m[1].trim();
+          break;
+        }
+      }
+
+      // Extract DOB
+      const dobMatch = ocrRawText.match(/(\d{2}[\/\-]\d{2}[\/\-]\d{4})/);
+      if (dobMatch) ocrExtractedDob = dobMatch[1];
+
+      // Extract Gender
+      const genderMatch = ocrRawText.match(/\b(Male|Female|MALE|FEMALE)\b/);
+      if (genderMatch) ocrExtractedGender = genderMatch[1];
+
+      console.log('[OCR EXTRACTED]:', { ocrExtractedName, ocrExtractedDob, ocrExtractedGender });
+    } else {
+      console.warn('[OCR] Tesseract.js not available — using QR payload for verification.');
+    }
+  } catch (ocrErr) {
+    console.warn('[OCR ERROR]:', ocrErr.message);
+  }
+
+  // ── Cross-Verify OCR extracted text against QR payload ──
+  let parsedQR = null;
+  try { parsedQR = JSON.parse(qrString); } catch(e) {}
+
+  const qrName = parsedQR?.name || matchedRecord.qrPayload?.name || matchedRecord.printedNameOnCard || matchedRecord.fullNameEnglish;
+  const qrDob = parsedQR?.dob || matchedRecord.qrPayload?.dob || matchedRecord.dob || '';
+  const qrGender = parsedQR?.gender || matchedRecord.qrPayload?.gender || matchedRecord.gender || '';
+
+  // If OCR extracted a name, compare it against QR name; otherwise fall back to preset record scores
+  let nameMatchScore = matchedRecord.qrNameMatchScore !== undefined ? matchedRecord.qrNameMatchScore : 100;
+  let ocrNameUsed = qrName;
+  let hardcopyNameUsed = matchedRecord.printedNameOnCard || matchedRecord.fullNameEnglish;
+
+  if (ocrExtractedName) {
+    nameMatchScore = calculateStringSimilarity(
+      normalizeForComparison(ocrExtractedName),
+      normalizeForComparison(qrName)
+    );
+    ocrNameUsed = qrName;
+    hardcopyNameUsed = ocrExtractedName;
+    console.log(`[OCR CROSS-VERIFY] QR Name: "${qrName}" vs OCR Name: "${ocrExtractedName}" → Score: ${nameMatchScore}%`);
+  }
+
+  // Store OCR results into state for display
+  state.ocrResult = {
+    rawText: ocrRawText,
+    extractedName: ocrExtractedName || hardcopyNameUsed,
+    extractedDob: ocrExtractedDob || qrDob,
+    extractedGender: ocrExtractedGender || qrGender,
+    qrName: ocrNameUsed,
+    nameMatchScore: Math.round(nameMatchScore * 10) / 10
+  };
+
+  // Override qrNameMatchScore in matchedRecord clone for evaluateDualAnalysis
+  const recordForAnalysis = {
+    ...matchedRecord,
+    printedNameOnCard: ocrExtractedName || matchedRecord.printedNameOnCard || matchedRecord.fullNameEnglish,
+    qrNameMatchScore: nameMatchScore
+  };
+
+  setTimeout(() => {
+    const timestamp = new Date().toLocaleString();
+    const officerId = state.activeOfficer?.id || 'IND-OFFICER';
+    const officerName = state.activeOfficer?.name || 'Authorized Officer';
+    const location = state.selectedDutyLocation;
+    const gpsString = getFormattedCoordinatesString() + ` (± ${state.gpsAccuracyMeters}m)`;
+
+    const analysis = evaluateDualAnalysis(recordForAnalysis, qrString);
+    console.log('[FINAL DUAL ANALYSIS]:', analysis);
+
+    if (analysis.accessGranted) {
+      state.verificationResult = {
+        isSuccess: true,
+        record: recordForAnalysis,
+        analysis,
+        scannedQR: qrString,
+        uploadedQRImage: state.uploadedQRPreview,
+        ocrResult: state.ocrResult,
+        timestamp, officerId, officerName, location,
+        gps: gpsString,
+        address: state.reverseGeocodedAddress
+      };
+      const auditItem = {
+        id: 'AUD-' + Math.floor(10000 + Math.random() * 90000),
+        verificationId: recordForAnalysis.verificationId,
+        scannedQR: qrString,
+        uploadedQRImage: state.uploadedQRPreview,
+        name: recordForAnalysis.fullNameEnglish || recordForAnalysis.printedNameOnCard,
+        docType: recordForAnalysis.docType,
+        status: 'VERIFIED',
+        qrScore: `${analysis.qrMatchScore}%`,
+        faceScore: `${analysis.faceConfidence}%`,
+        timestamp, location,
+        gps: gpsString,
+        address: state.reverseGeocodedAddress,
+        officerId,
+        refNo: 'AUD-SUCCESS-' + Math.floor(100000 + Math.random() * 900000)
+      };
+      state.auditLogs.unshift(auditItem);
+      pushAuditLogToSupabase(auditItem);
+      sounds.playSuccess();
+      setScreen('success');
+    } else {
+      state.verificationResult = {
+        isSuccess: false,
+        record: recordForAnalysis,
+        analysis,
+        scannedQR: qrString,
+        uploadedQRImage: state.uploadedQRPreview,
+        ocrResult: state.ocrResult,
+        timestamp, officerId, officerName, location,
+        gps: gpsString,
+        address: state.reverseGeocodedAddress,
+        failureReason: analysis.failureReason
+      };
+      sounds.playAlert();
+      setScreen('failed');
+    }
+  }, 1900);
 }
 
 function executeStep2CrossVerification() {
@@ -1652,7 +1822,6 @@ function executeStep2CrossVerification() {
     render();
     return;
   }
-
   processScannedQRData(state.qrStep1Payload.qrData, state.qrStep1Payload.decodeFailed);
 }
 
@@ -3465,18 +3634,6 @@ function renderQRScanner() {
             </p>
           </div>
 
-          <!-- Document Verification Target Mode Selector -->
-          <div class="p-3 bg-slate-900/90 rounded-2xl border border-white/15 space-y-2 text-left">
-            <span class="text-[10px] font-extrabold text-gov-lightBlue uppercase tracking-wider block">Document Verification Mode:</span>
-            <div class="grid grid-cols-2 gap-2">
-              <button onclick="state.forceFakeEvaluation=false; render();" class="py-2.5 px-3 rounded-xl text-xs font-extrabold flex items-center justify-center space-x-1.5 transition ${!state.forceFakeEvaluation ? 'bg-emerald-500 text-white shadow-lg border border-emerald-300' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'}">
-                <span>🟢 Authentic Card</span>
-              </button>
-              <button onclick="state.forceFakeEvaluation=true; render();" class="py-2.5 px-3 rounded-xl text-xs font-extrabold flex items-center justify-center space-x-1.5 transition ${state.forceFakeEvaluation ? 'bg-red-500 text-white shadow-lg border border-red-300' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'}">
-                <span>🛑 Fake / Altered Card</span>
-              </button>
-            </div>
-          </div>
 
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
             <button onclick="document.getElementById('step1CameraInput').click()" 
