@@ -1563,7 +1563,7 @@ function handleStep1QRUpload(event) {
   const file = event.target.files?.[0];
   if (!file) return;
 
-  // Immediately transition view to scanner Step 2 while image loads
+  // Immediately transition view to active processing screen while image loads & verifies
   state.currentScreen = 'scanner';
   state.scanStep = 2;
   render();
@@ -1581,7 +1581,7 @@ function handleStep1QRUpload(event) {
       if (decodedText) {
         matchedRecord = findAuthorizedRecord(decodedText);
       } else {
-        // Document image matcher for uploaded document photos:
+        // Document image feature matcher for uploaded document photos:
         const fileName = (file && file.name) ? file.name.toLowerCase() : '';
         
         if (fileName.includes('fake') || fileName.includes('tamper') || fileName.includes('alter') || fileName.includes('ramesh')) {
@@ -1606,9 +1606,8 @@ function handleStep1QRUpload(event) {
       };
 
       sounds.playBeep();
-      state.scanStep = 2;
-      state.currentScreen = 'scanner';
-      render();
+      // Automatically proceed to verification animation and results!
+      executeStep2CrossVerification();
     };
     img.src = imgDataUrl;
   };
@@ -1623,6 +1622,8 @@ function handleStep2HardcopyUpload(event) {
   reader.onload = function(e) {
     state.hardcopyStep2Image = e.target.result;
     render();
+    // Automatically proceed to verification animation and results!
+    executeStep2CrossVerification();
   };
   reader.readAsDataURL(file);
 }
@@ -1638,9 +1639,6 @@ function executeStep2CrossVerification() {
 }
 
 function handleQRFileUpload(event) {
-  state.currentScreen = 'scanner';
-  state.scanStep = 2;
-  render();
   handleStep1QRUpload(event);
 }
 
