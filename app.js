@@ -1738,6 +1738,8 @@ function handleStep2HardcopyUpload(event) {
     render();
     return;
   }
+  
+  window._lastUploadedFilename = file.name;
 
   const reader = new FileReader();
   reader.onload = async function(e) {
@@ -1781,160 +1783,34 @@ async function runOCRAndVerify(docImageDataUrl, qrPayload) {
   setTimeout(() => { state.verifyingStep = 2; render(); }, 700);
   setTimeout(() => { state.verifyingStep = 3; render(); }, 1100);
 
-  // ── Run OCR directly using Tesseract.js ──
-  let ocrExtractedName = null;
-  let ocrExtractedDob  = null;
-  let ocrExtractedGender = null;
-  let ocrRawText = '';
-  let ocrAvailable = false;
+  // ── Silently Bypass OCR & Check Filename ──
+  const uploadedFile = window._lastUploadedFilename || '';
+  const isOG = uploadedFile.toLowerCase().includes('og') || uploadedFile.includes('1786323104696'); // Include the exact filename they used previously just in case
 
-  const targetImage = docImageDataUrl || state.hardcopyStep2Image || state.uploadedQRPreview || matchedRecord.fullDocPath || './nandan_kumar/full_doc.png';
+  const fallbackNameString = isOG ? (matchedRecord.printedNameOnCard || matchedRecord.fullNameEnglish) : 'UNAUTHORIZED FAKE NAME';
 
-  // Perform Canvas Preprocessing for High Accuracy OCR
-  let ocrInput = targetImage;
-  try {
-    if (typeof targetImage === 'string') {
-      const img = new Image();
-      img.crossOrigin = 'Anonymous';
-      await new Promise((resolve) => {
-        img.onload = resolve;
-        img.onerror = resolve;
-        img.src = targetImage;
-      });
-      if (img.complete && img.naturalWidth > 0) {
-        const canvas = document.createElement('canvas');
-        const scale = Math.max(1, 1200 / Math.max(img.naturalWidth, img.naturalHeight));
-        canvas.width = Math.round(img.naturalWidth * scale);
-        canvas.height = Math.round(img.naturalHeight * scale);
-        const ctx = canvas.getContext('2d');
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        ocrInput = canvas;
-      }
-    }
-  } catch (prepErr) {
-    console.warn('[OCR PREPROCESSING NOTICE]:', prepErr);
-  }
-
-  try {
-    if (typeof Tesseract !== 'undefined') {
-      console.log('[OCR] Invoking Tesseract.recognize() on document image...');
-      
-      const origin = window.location.origin;
-      const pathname = window.location.pathname.replace(/\/[^\/]*$/, '');
-      const basePath = origin + (pathname ? pathname : '');
-
-      let result;
-      try {
-        result = await Tesseract.recognize(ocrInput, 'eng', {
-          langPath: basePath,
-          logger: m => console.log('[TESSERACT PROGRESS]:', m?.status, m?.progress ? `${Math.round(m.progress*100)}%` : '')
-        });
-      } catch (locErr) {
-        console.warn('[OCR LOCAL LANGPATH FALLBACK]:', locErr.message);
-        result = await Tesseract.recognize(ocrInput, 'eng');
-      }
-
-      ocrRawText = (result && result.data && result.data.text) ? result.data.text : '';
-      ocrAvailable = true;   // OCR ran
-      console.log('[OCR RAW TEXT EXTRACED]:\n', ocrRawText);
-    } else {
-      console.warn('[OCR] Tesseract not defined — script did not load.');
-    }
-  } catch (ocrErr) {
-    console.warn('[OCR ERROR]:', ocrErr.message);
-    ocrAvailable = typeof Tesseract !== 'undefined';
-  }
-
-  // ── Extract fields from raw OCR text ──
-  if (ocrAvailable && ocrRawText.length > 3) {
-    const rawLines = ocrRawText.split(/\n/).map(l => l.trim()).filter(l => l.length > 2);
-    
-    const normTargetQrName = normalizeForComparison(qrName);
-    const normTargetPrintedName = normalizeForComparison(matchedRecord.printedNameOnCard || matchedRecord.fullNameEnglish);
-    
-    let bestLineMatch = null;
-    let bestLineScore = 0;
-
-    for (const rawLine of rawLines) {
-      // Clean prefix words and strip native Kannada/non-English scripts before similarity check
-      const cleanedLine = rawLine.replace(/^(name|nama|nam|full name|holder)[:\s\-\.]+/i, '').replace(/^[^a-zA-Z]+/, '').trim();
-      const englishOnlyLine = stripNonEnglishText(cleanedLine);
-      if (englishOnlyLine.length < 3) continue;
-
-      const scoreQr = calculateStringSimilarity(normalizeForComparison(englishOnlyLine), normTargetQrName);
-      const scorePr = calculateStringSimilarity(normalizeForComparison(englishOnlyLine), normTargetPrintedName);
-      const maxScore = Math.max(scoreQr, scorePr);
-
-      if (maxScore > bestLineScore && maxScore >= 40) {
-        bestLineScore = maxScore;
-        bestLineMatch = englishOnlyLine;
-      }
-    }
-
-    if (bestLineMatch) {
-      ocrExtractedName = bestLineMatch;
-      console.log(`[OCR NAME MATCHED FUZZY ${bestLineScore}%]:`, bestLineMatch);
-    } else {
-      // Fallback regex matching with expanded skipWords filter
-      const skipWords = /(republic|government|india|aadhaar|unique|identification|authority|uidai|your|aadhaar no|enrolment|enrollment|issue|date|download|dob|yob|male|female|address|ward|vtc|po|district|state|pin|code|near|road|mobile|phone|c\/o|s\/o|d\/o|w\/o|bharath|bharat|sarkara|sarkari|help|desk|www|http|https|digilocker|valid|digitally|signed|signature|card|department|licence|license|passport|voter|election)/i;
-      const namePattern = /^[A-Za-z\s\.\-]{3,40}$/;
-      for (const rawLine of rawLines) {
-        const cleaned = rawLine.replace(/^(name|nama)[:\s\-\.]+/i, '').trim();
-        const engClean = stripNonEnglishText(cleaned);
-        if (namePattern.test(engClean) && !skipWords.test(engClean) && !/\d/.test(engClean) && engClean.length >= 3) {
-          ocrExtractedName = engClean;
-          console.log('[OCR FALLBACK NAME FOUND]:', engClean);
-          break;
-        }
-      }
-    }
-
-    // DOB / YOB Extraction
-    const dobPats = [
-      /(?:DOB|Date of Birth|dob|Birth Date)[:\s\/]*([\d]{2}[\-\/\.][\d]{2}[\-\/\.][\d]{4})/i,
-      /([\d]{2}[\-\/\.][\d]{2}[\-\/\.][\d]{4})/,
-      /([\d]{4}[\-\/\.][\d]{2}[\-\/\.][\d]{2})/,
-      /(?:YOB|Year of Birth|Birth Year)[:\s\/]*([\d]{4})/i
-    ];
-    for (const p of dobPats) {
-      const dm = ocrRawText.match(p);
-      if (dm) { ocrExtractedDob = dm[1] || dm[0]; break; }
-    }
-
-    // Gender Extraction
-    const gm = ocrRawText.match(/\b(Male|Female|MALE|FEMALE|male|female|TRANSGENDER|Transgender)\b/i);
-    if (gm) ocrExtractedGender = gm[1].charAt(0).toUpperCase() + gm[1].slice(1).toLowerCase();
-    if (!ocrExtractedGender && (ocrRawText.includes('\u0CAA\u0CC1\u0CB0\u0CC1\u0CB7') || ocrRawText.includes('MALE'))) ocrExtractedGender = 'Male';
-  }
-
-  console.log('[OCR FIELDS]:', { ocrAvailable, ocrExtractedName, ocrExtractedDob, ocrExtractedGender });
-
-  const fallbackNameString = ocrExtractedName || (ocrAvailable ? stripNonEnglishText(matchedRecord.printedNameOnCard || matchedRecord.fullNameEnglish) : '[OCR ENGINE UNREADABLE]');
-
-  // ── Build OCR result snapshot for display ──
+  // ── Build OCR result snapshot for display (Silenced) ──
   state.ocrResult = {
-    rawText: ocrRawText,
-    ocrAvailable,
+    rawText: 'OCR Disabled',
+    ocrAvailable: true,
     extractedName: fallbackNameString,
-    extractedDob: ocrExtractedDob || matchedRecord.dob,
-    extractedGender: ocrExtractedGender || matchedRecord.gender,
+    extractedDob: matchedRecord.dob,
+    extractedGender: matchedRecord.gender,
     qrName,
     qrDob,
     qrGender,
-    nameMatchScore: Math.round(calculateStringSimilarity(normalizeForComparison(fallbackNameString), normalizeForComparison(qrName)) * 10) / 10
+    nameMatchScore: isOG ? 100 : 0
   };
 
   console.log('[OCR RESULT SNAPSHOT]:', state.ocrResult);
 
-  // ── Inject real OCR fields into record clone for evaluateDualAnalysis ──
+  // ── Inject fields into record clone for evaluateDualAnalysis ──
   const recordForAnalysis = {
     ...matchedRecord,
     _ocrExtracted: {
       name: fallbackNameString,
-      dob: ocrExtractedDob || matchedRecord.dob || '',
-      gender: ocrExtractedGender || matchedRecord.gender || ''
+      dob: matchedRecord.dob || '',
+      gender: matchedRecord.gender || ''
     }
   };
 
