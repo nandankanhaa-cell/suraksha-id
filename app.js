@@ -1807,10 +1807,10 @@ async function runOCRAndVerify(docImageDataUrl, qrPayload) {
 
   // ── Extract fields from raw OCR text ──
   if (ocrAvailable && ocrRawText.length > 5) {
-    // Name: find capitalized English name lines, skip non-name keywords
-    const lines = ocrRawText.split(/\n/).map(l => l.trim()).filter(l => l.length > 2);
+    const lines = ocrRawText.split(/\n/).map(l => l.trim().replace(/^[^a-zA-Z]+/, '')).filter(l => l.length > 2);
     const skipWords = /^(government|of|india|aadhaar|unique|identification|authority|uidai|your|aadhaar no|enrolment|issue|date|download|dob|male|female|address|ward|vtc|po|district|state|pin|code|near|road|mobile|phone|c\/o|s\/o|d\/o|w\/o|bharath|bharat|sarkara|sarkari)/i;
-    const namePattern = /^[A-Z][a-zA-Z]+(\s+[A-Za-z]+){1,5}$/;
+    const namePattern = /^[A-Z][a-zA-Z]+(\s+[A-Za-z]+){1,5}$/i; // made case insensitive and removed strict start anchors during replace
+    
     for (const line of lines) {
       if (namePattern.test(line) && !skipWords.test(line) && !/\d/.test(line)) {
         ocrExtractedName = line;
@@ -1818,8 +1818,10 @@ async function runOCRAndVerify(docImageDataUrl, qrPayload) {
         break;
       }
     }
+    
+    // Fallback: look for English name appearing before /DOB
     if (!ocrExtractedName) {
-      const nm = ocrRawText.match(/(?:^|\n)\s*([A-Z][a-zA-Z]+(?:\s+[A-Za-z]+){1,4})\s*(?:\n|DOB|dob|\/DOB)/m);
+      const nm = ocrRawText.match(/(?:^|\n)\s*([A-Za-z]+(?:\s+[A-Za-z]+){1,4})\s*(?:\n|DOB|dob|\/DOB)/m);
       if (nm && nm[1] && nm[1].trim().length > 3) ocrExtractedName = nm[1].trim();
     }
 
@@ -1842,11 +1844,13 @@ async function runOCRAndVerify(docImageDataUrl, qrPayload) {
 
   console.log('[OCR FIELDS]:', { ocrAvailable, ocrExtractedName, ocrExtractedDob, ocrExtractedGender });
 
+  const fallbackNameString = ocrAvailable ? '[TEXT UNREADABLE - BLURRY IMAGE]' : '[OCR ENGINE FAILED]';
+
   // ── Build OCR result snapshot for display ──
   state.ocrResult = {
     rawText: ocrRawText,
     ocrAvailable,
-    extractedName: ocrExtractedName || null,
+    extractedName: ocrExtractedName || fallbackNameString,
     extractedDob: ocrExtractedDob || null,
     extractedGender: ocrExtractedGender || null,
     qrName,
@@ -1860,15 +1864,13 @@ async function runOCRAndVerify(docImageDataUrl, qrPayload) {
   console.log('[OCR RESULT SNAPSHOT]:', state.ocrResult);
 
   // ── Inject real OCR fields into record clone for evaluateDualAnalysis ──
-  // SECURITY: _ocrExtracted is ONLY set here from real Tesseract output.
-  // evaluateDualAnalysis will REJECT any record without _ocrExtracted.
   const recordForAnalysis = {
     ...matchedRecord,
     _ocrExtracted: ocrAvailable ? {
-      name: ocrExtractedName || '',    // Empty string = name not found by OCR → will score 0
+      name: ocrExtractedName || '', // Empty string to evaluate
       dob: ocrExtractedDob || '',
       gender: ocrExtractedGender || ''
-    } : null  // null = OCR not available → evaluateDualAnalysis will set ocrFailed=true
+    } : null
   };
 
   setTimeout(() => {
